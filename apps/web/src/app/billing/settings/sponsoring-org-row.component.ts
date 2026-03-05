@@ -2,44 +2,52 @@
 // @ts-strict-ignore
 import { formatDate } from "@angular/common";
 import { Component, EventEmitter, Input, Output, OnInit } from "@angular/core";
-import { firstValueFrom, map, Observable } from "rxjs";
+import { firstValueFrom, map, Observable, switchMap } from "rxjs";
 
 import { ApiService } from "@bitwarden/common/abstractions/api.service";
 import { PolicyService } from "@bitwarden/common/admin-console/abstractions/policy/policy.service.abstraction";
 import { PolicyType } from "@bitwarden/common/admin-console/enums";
 import { Organization } from "@bitwarden/common/admin-console/models/domain/organization";
-import { FeatureFlag } from "@bitwarden/common/enums/feature-flag.enum";
-import { ConfigService } from "@bitwarden/common/platform/abstractions/config/config.service";
+import { AccountService } from "@bitwarden/common/auth/abstractions/account.service";
+import { getUserId } from "@bitwarden/common/auth/services/account.service";
+import { OrganizationSponsorshipApiServiceAbstraction } from "@bitwarden/common/billing/abstractions/organizations/organization-sponsorship-api.service.abstraction";
 import { I18nService } from "@bitwarden/common/platform/abstractions/i18n.service";
 import { LogService } from "@bitwarden/common/platform/abstractions/log.service";
-import { PlatformUtilsService } from "@bitwarden/common/platform/abstractions/platform-utils.service";
 import { DialogService, ToastService } from "@bitwarden/components";
 
+// FIXME(https://bitwarden.atlassian.net/browse/CL-764): Migrate to OnPush
+// eslint-disable-next-line @angular-eslint/prefer-on-push-component-change-detection
 @Component({
   selector: "[sponsoring-org-row]",
   templateUrl: "sponsoring-org-row.component.html",
+  standalone: false,
 })
 export class SponsoringOrgRowComponent implements OnInit {
+  // FIXME(https://bitwarden.atlassian.net/browse/CL-903): Migrate to Signals
+  // eslint-disable-next-line @angular-eslint/prefer-signals
   @Input() sponsoringOrg: Organization = null;
+  // FIXME(https://bitwarden.atlassian.net/browse/CL-903): Migrate to Signals
+  // eslint-disable-next-line @angular-eslint/prefer-signals
   @Input() isSelfHosted = false;
 
+  // FIXME(https://bitwarden.atlassian.net/browse/CL-903): Migrate to Signals
+  // eslint-disable-next-line @angular-eslint/prefer-output-emitter-ref
   @Output() sponsorshipRemoved = new EventEmitter();
 
   statusMessage = "loading";
   statusClass: "tw-text-success" | "tw-text-danger" = "tw-text-success";
   isFreeFamilyPolicyEnabled$: Observable<boolean>;
-  isFreeFamilyFlagEnabled: boolean;
   private locale = "";
 
   constructor(
     private apiService: ApiService,
     private i18nService: I18nService,
     private logService: LogService,
-    private platformUtilsService: PlatformUtilsService,
     private dialogService: DialogService,
     private toastService: ToastService,
-    private configService: ConfigService,
     private policyService: PolicyService,
+    private accountService: AccountService,
+    private organizationSponsorshipApiService: OrganizationSponsorshipApiServiceAbstraction,
   ) {}
 
   async ngOnInit() {
@@ -51,23 +59,20 @@ export class SponsoringOrgRowComponent implements OnInit {
       this.sponsoringOrg.familySponsorshipValidUntil,
       this.sponsoringOrg.familySponsorshipLastSyncDate,
     );
-    this.isFreeFamilyFlagEnabled = await this.configService.getFeatureFlag(
-      FeatureFlag.DisableFreeFamiliesSponsorship,
-    );
 
-    if (this.isFreeFamilyFlagEnabled) {
-      this.isFreeFamilyPolicyEnabled$ = this.policyService
-        .getAll$(PolicyType.FreeFamiliesSponsorshipPolicy)
-        .pipe(
-          map(
-            (policies) =>
-              Array.isArray(policies) &&
-              policies.some(
-                (policy) => policy.organizationId === this.sponsoringOrg.id && policy.enabled,
-              ),
+    this.isFreeFamilyPolicyEnabled$ = this.accountService.activeAccount$.pipe(
+      getUserId,
+      switchMap((userId) =>
+        this.policyService.policiesByType$(PolicyType.FreeFamiliesSponsorshipPolicy, userId),
+      ),
+      map(
+        (policies) =>
+          Array.isArray(policies) &&
+          policies.some(
+            (policy) => policy.organizationId === this.sponsoringOrg.id && policy.enabled,
           ),
-        );
-    }
+      ),
+    );
   }
 
   async revokeSponsorship() {
@@ -79,7 +84,10 @@ export class SponsoringOrgRowComponent implements OnInit {
   }
 
   async resendEmail() {
-    await this.apiService.postResendSponsorshipOffer(this.sponsoringOrg.id);
+    await this.organizationSponsorshipApiService.postResendSponsorshipOffer(
+      this.sponsoringOrg.id,
+      this.sponsoringOrg.familySponsorshipFriendlyName,
+    );
     this.toastService.showToast({
       variant: "success",
       title: null,
@@ -87,14 +95,21 @@ export class SponsoringOrgRowComponent implements OnInit {
     });
   }
 
-  get isSentAwaitingSync() {
-    return this.isSelfHosted && !this.sponsoringOrg.familySponsorshipLastSyncDate;
-  }
-
   private async doRevokeSponsorship() {
+    const content = this.sponsoringOrg.familySponsorshipValidUntil
+      ? this.i18nService.t(
+          "updatedRevokeSponsorshipConfirmationForAcceptedSponsorship",
+          this.sponsoringOrg.familySponsorshipFriendlyName,
+          formatDate(this.sponsoringOrg.familySponsorshipValidUntil, "MM/dd/yyyy", this.locale),
+        )
+      : this.i18nService.t(
+          "updatedRevokeSponsorshipConfirmationForSentSponsorship",
+          this.sponsoringOrg.familySponsorshipFriendlyName,
+        );
+
     const confirmed = await this.dialogService.openSimpleDialog({
-      title: `${this.i18nService.t("remove")} ${this.sponsoringOrg.familySponsorshipFriendlyName}?`,
-      content: { key: "revokeSponsorshipConfirmation" },
+      title: `${this.i18nService.t("removeSponsorship")}?`,
+      content,
       acceptButtonText: { key: "remove" },
       type: "warning",
     });
@@ -103,7 +118,7 @@ export class SponsoringOrgRowComponent implements OnInit {
       return;
     }
 
-    await this.apiService.deleteRevokeSponsorship(this.sponsoringOrg.id);
+    await this.organizationSponsorshipApiService.deleteRevokeSponsorship(this.sponsoringOrg.id);
     this.toastService.showToast({
       variant: "success",
       title: null,
